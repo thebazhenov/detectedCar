@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from models import StartDetectionYolo, StopDetectionYolo
 from yolo_class import YoloClass
@@ -36,3 +37,6 @@ def stop_detection(detection: StopDetectionYolo):
         HTTPException(
             status_code=500
         )
+
+if __name__ == "__main__":
+    uvicorn.run(app)
