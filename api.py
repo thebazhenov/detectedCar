@@ -106,7 +106,7 @@ async def detect_objects(
         # Детекция
         results = model(image_np, classes=[class_yolo.get(description, None)])
         plates = []
-        if description in "Автомобиль":
+        if description in "car":
             async with httpx.AsyncClient(timeout=30) as client:
                 files = {
                     "file": (
