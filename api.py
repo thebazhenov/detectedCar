@@ -17,6 +17,9 @@ from models import *
 from yolo_class import YoloClass
 import httpx
 
+from database.schemas import *
+from database.uow import UnitOfWork
+
 app = FastAPI()
 
 # Настройка разрешенных доменов
@@ -73,6 +76,25 @@ def overlay_plates(img_bgr: np.ndarray, detections: List[Dict]) -> np.ndarray:
                 cv2.putText(canvas, det["text"], (x1, max(0, y1-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (36,255,12), 2, cv2.LINE_AA)
     return canvas
+
+
+@app.post("/register", response_model=UserRead, status_code=201)
+async def register_user(payload: UserCreate):
+    async with UnitOfWork()() as uow:
+        existing = await uow.users.by_email(payload.email)
+        if existing:
+            raise HTTPException(status_code=409, detail="User already exists")
+        user = await uow.users.create(payload)
+        return user
+
+
+@app.post("/auth", response_model=UserRead)
+async def auth_user(payload: AuthRequest):
+    async with UnitOfWork()() as uow:
+        user = await uow.users.check_credentials(payload.email, payload.password)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        return user
 
 
 @app.post("/start_detection")
