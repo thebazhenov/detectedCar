@@ -23,15 +23,22 @@ from database.uow import UnitOfWork
 app = FastAPI()
 
 # Настройка разрешенных доменов
-origins = ["http://localhost:5173"]  # Сюда добавьте адреса вашего фронтенда
+origins = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+]  # Добавьте сюда адрес(а) вашего фронтенда
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],  # Методы запросов, которые будут разрешены
-    allow_headers=["*"],           # Разрешение любых заголовков
+    allow_methods=["*"],  # Or specify: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_headers=["*"],  # Or specify: ["Content-Type", "Authorization"]
 )
+
 
 detection_dict = {}
 
@@ -86,6 +93,14 @@ async def register_user(payload: UserCreate):
             raise HTTPException(status_code=409, detail="User already exists")
         user = await uow.users.create(payload)
         return user
+
+
+@app.get("/users", response_model=list[UserRead])
+async def list_users(limit: int = 50, offset: int = 0):
+    """Возвращает список пользователей с пагинацией."""
+    async with UnitOfWork()() as uow:
+        users = await uow.users.list(limit=limit, offset=offset)
+        return users
 
 
 @app.post("/auth", response_model=UserRead)
@@ -212,16 +227,6 @@ def get_results():
     #         f.write(contents)
     #
     #     return {"filename": filename, "content-type": content_type}
-
-
-# Добавляем обработчик для метода OPTIONS
-@app.options("/start_detection")
-async def options_start_detection(request):
-    headers = request.headers.get("Access-Control-Request-Headers")
-    if headers is not None:
-        return {"headers": headers}
-
-    return {"message": "Options available"}
 
 
 @app.post("/stop_detection")
