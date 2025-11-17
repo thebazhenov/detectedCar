@@ -1,6 +1,6 @@
 import { Shield, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
+import { logout } from "@/integrations/api/auth";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
@@ -8,12 +8,12 @@ export const Header = () => {
   const navigate = useNavigate();
 
   const handleLogout = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) {
-      toast.error("Ошибка при выходе");
-    } else {
+    try {
+      await Promise.resolve(logout());
       toast.success("Выход выполнен");
       navigate("/auth");
+    } catch {
+      toast.error("Ошибка при выходе");
     }
   };
 
