@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { apiBaseUrl } from "@/integrations/api/client";
 import { getAuthToken } from "@/integrations/api/auth";
 import { usePublicDetectionSettings } from "@/hooks/useDetectionSettings";
+import { useDemoVideo } from "@/hooks/useDemoVideo";
 
 const TARGET_LABELS: Record<string, string> = {
   vehicles: "Транспорт",
@@ -13,6 +14,7 @@ const TARGET_LABELS: Record<string, string> = {
 
 export const VideoWidget = () => {
   const { data: settings } = usePublicDetectionSettings();
+  const { data: demoVideo } = useDemoVideo();
   const token = getAuthToken();
   const sourceType = settings?.sourceType;
   const status = buildStatus(sourceType);
@@ -23,13 +25,7 @@ export const VideoWidget = () => {
       ? `${apiBaseUrl}/video/stream?token=${encodeURIComponent(token)}`
       : undefined;
 
-  // If sourceType is file and a demo video path is configured, compute demo url as fallback
-  const demoVideoPath = settings?.videoPath;
-  const demoVideoUrl = demoVideoPath
-    ? demoVideoPath.startsWith("http")
-      ? demoVideoPath
-      : `${apiBaseUrl}${demoVideoPath}`
-    : undefined;
+  const fallbackVideoUrl = buildVideoUrl(demoVideo?.file_url ?? settings?.videoPath);
 
   return (
     <Card className="glass-card">
@@ -56,12 +52,17 @@ export const VideoWidget = () => {
           {/* Prefer the processed MJPEG stream when authenticated (token present) so the
               widget shows YOLO overlays and loops file playback. If no token is available,
               fall back to serving the static demo video file. */}
-          {sourceType === "file" && streamUrl ? (
+          {streamUrl ? (
             <img src={streamUrl} alt="YOLO stream" className="h-full w-full object-cover" />
-          ) : sourceType === "file" && demoVideoUrl ? (
-            <video src={demoVideoUrl} controls loop muted playsInline className="h-full w-full object-cover" />
-          ) : streamUrl ? (
-            <img src={streamUrl} alt="YOLO stream" className="h-full w-full object-cover" />
+          ) : fallbackVideoUrl ? (
+            <video
+              src={fallbackVideoUrl}
+              controls
+              loop
+              muted
+              playsInline
+              className="h-full w-full object-cover"
+            />
           ) : (
             <NoSourceMessage sourceType={sourceType} />
           )}
@@ -94,6 +95,17 @@ const buildStatus = (
     className: "bg-destructive/10 text-destructive border-destructive/30",
     indicator: "bg-destructive",
   };
+};
+
+const buildVideoUrl = (path?: string | null) => {
+  if (!path) {
+    return undefined;
+  }
+  if (path.startsWith("http")) {
+    return path;
+  }
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return `${apiBaseUrl}${normalized}`;
 };
 
 const NoSourceMessage = ({ sourceType }: { sourceType?: string | null }) => {

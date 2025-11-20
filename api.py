@@ -31,11 +31,6 @@ from utils.settings_manager import (
     get_public_detection_settings,
 )
 from utils.video_stream import VideoStreamManager
-import os
-try:
-    import redis
-except Exception:
-    redis = None
 
 app = FastAPI()
 security = HTTPBasic()
@@ -48,49 +43,49 @@ def ensure_admin_user(user: User):
     if user.role != ROLE_ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
 
-@app.on_event("startup")
-async def _ensure_admin_and_demo():
-    # Try to create admin user if DB is reachable
-    try:
-        async with UnitOfWork()() as uow:
-            existing = await uow.users.by_email(ADMIN_EMAIL)
-            if not existing:
-                await uow.users.create(UserCreate(email=ADMIN_EMAIL, password=ADMIN_PASSWORD, role=ROLE_ADMIN))
-    except Exception as e:
-        print(f"Startup DB check skipped: {e}")
+# @app.on_event("startup")
+# async def _ensure_admin_and_demo():
+#     # Try to create admin user if DB is reachable
+#     try:
+#         async with UnitOfWork()() as uow:
+#             existing = await uow.users.by_email(ADMIN_EMAIL)
+#             if not existing:
+#                 await uow.users.create(UserCreate(email=ADMIN_EMAIL, password=ADMIN_PASSWORD, role=ROLE_ADMIN))
+#     except Exception as e:
+#         print(f"Startup DB check skipped: {e}")
 
-    # On startup, if detection source not configured, select latest demo video automatically
-    try:
-        current = load_detection_settings()
-        if current.get("sourceType") is None:
-            latest = _latest_demo_video()
-            if latest:
-                resp = _demo_video_response(latest.name)
-                updated = update_detection_settings(
-                    {
-                        "sourceType": "file",
-                        "videoPath": resp["file_url"],
-                        "videoFileName": latest.name,
-                    }
-                )
-                # ensure video manager picks up new settings
-                try:
-                    video_stream_manager.update_settings(updated)
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"Startup demo selection skipped: {e}")
+    # # On startup, if detection source not configured, select latest demo video automatically
+    # try:
+    #     current = load_detection_settings()
+    #     if current.get("sourceType") is None:
+    #         latest = _latest_demo_video()
+    #         if latest:
+    #             resp = _demo_video_response(latest.name)
+    #             updated = update_detection_settings(
+    #                 {
+    #                     "sourceType": "file",
+    #                     "videoPath": resp["file_url"],
+    #                     "videoFileName": latest.name,
+    #                 }
+    #             )
+    #             # ensure video manager picks up new settings
+    #             try:
+    #                 video_stream_manager.update_settings(updated)
+    #             except Exception:
+    #                 pass
+    # except Exception as e:
+    #     print(f"Startup demo selection skipped: {e}")
 
 
-@app.on_event("startup")
-async def ensure_admin_exists():
-    # Run the startup tasks but don't let DB/connectivity issues block startup.
-    try:
-        await asyncio.wait_for(_ensure_admin_and_demo(), timeout=5.0)
-    except asyncio.TimeoutError:
-        print("Startup tasks timed out (DB likely unavailable). Continuing without DB initialization.")
-    except Exception as e:
-        print(f"Unexpected error during startup tasks: {e}")
+# @app.on_event("startup")
+# async def ensure_admin_exists():
+#     # Run the startup tasks but don't let DB/connectivity issues block startup.
+#     try:
+#         await asyncio.wait_for(_ensure_admin_and_demo(), timeout=5.0)
+#     except asyncio.TimeoutError:
+#         print("Startup tasks timed out (DB likely unavailable). Continuing without DB initialization.")
+#     except Exception as e:
+#         print(f"Unexpected error during startup tasks: {e}")
 
 # Настройка разрешенных доменов
 origins = [
@@ -173,16 +168,7 @@ def get_model() -> YOLO:
             raise
     return model
 
-# Try to initialize Redis client if available via REDIS_URL env var
-redis_client = None
-if redis is not None:
-    try:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        redis_client = redis.Redis.from_url(redis_url)
-    except Exception:
-        redis_client = None
-
-video_stream_manager = VideoStreamManager(DEMO_DIR, load_yolo_model, redis_client=redis_client)
+video_stream_manager = VideoStreamManager(DEMO_DIR, load_yolo_model)
 video_stream_manager.update_settings(current_detection_settings, restart=False)
 
 
@@ -214,6 +200,11 @@ class DetectionSettingsUpdatePayload(BaseModel):
     detectionTarget: Optional[Literal["vehicles", "people"]] = None
     detectionModel: Optional[str] = None
     widgets: Optional[WidgetPreferencesPayload] = None
+
+
+class DemoVideoResponse(BaseModel):
+    file_name: str
+    file_url: str
 
 
 def detection_response(settings: Dict[str, Any], mask_rtsp: bool = False) -> DetectionSettingsResponse:
@@ -463,6 +454,11 @@ def _demo_video_response(file_name: str) -> Dict[str, str]:
     }
 
 
+@app.get("/", response_model=dict)
+def root_healthcheck():
+    return {"status": "ok"}
+
+
 def _latest_demo_video() -> Optional[Path]:
     files = sorted(
         [f for f in DEMO_DIR.iterdir() if f.is_file()],
@@ -472,9 +468,17 @@ def _latest_demo_video() -> Optional[Path]:
     return files[0] if files else None
 
 
-@app.get("/demo/video")
+@app.get("/demo/video", response_model=DemoVideoResponse)
 def get_demo_video_metadata(current_user: User = Depends(get_current_user)):
     ensure_admin_user(current_user)
+    latest = _latest_demo_video()
+    if not latest:
+        raise HTTPException(status_code=404, detail="Demo video not found")
+    return _demo_video_response(latest.name)
+
+
+@app.get("/demo/video/public", response_model=DemoVideoResponse)
+def get_demo_video_public():
     latest = _latest_demo_video()
     if not latest:
         raise HTTPException(status_code=404, detail="Demo video not found")
@@ -546,32 +550,14 @@ async def video_stream(token: str = Query(..., alias="token")):
 
 @app.get("/video/frame")
 def get_latest_frame():
-    """Return latest frame as image/jpeg.
-
-    This endpoint first attempts to read the latest frame from Redis (if configured).
-    If Redis is not available or no frame is cached, it falls back to the in-memory frame.
-    """
-    # Try Redis first
-    if redis is not None and redis_client is not None:
-        try:
-            data = redis_client.get("video:latest_frame")
-            if data:
-                return Response(content=data, media_type="image/jpeg")
-        except Exception:
-            pass
-
-    # Fallback to in-memory frame
+    """Return latest frame as image/jpeg."""
     data = video_stream_manager.get_frame_bytes()
     return Response(content=data, media_type="image/jpeg")
 
 
 @app.websocket("/ws/video")
 async def websocket_video(websocket: WebSocket, token: str = Query(..., alias="token")):
-    """WebSocket endpoint that streams base64-encoded JPEG frames.
-
-    Authentication: expects `token` query param (same token format as `/video/stream`).
-    The handler will attempt to read frames from Redis first, otherwise from in-memory latest frame.
-    """
+    """WebSocket endpoint that streams base64-encoded JPEG frames."""
     # Accept and then authenticate
     await websocket.accept()
     try:
@@ -588,15 +574,7 @@ async def websocket_video(websocket: WebSocket, token: str = Query(..., alias="t
 
     try:
         while True:
-            # Try Redis first
-            data = None
-            if redis is not None and redis_client is not None:
-                try:
-                    data = redis_client.get("video:latest_frame")
-                except Exception:
-                    data = None
-            if not data:
-                data = video_stream_manager.get_frame_bytes()
+            data = video_stream_manager.get_frame_bytes()
 
             if data:
                 try:

@@ -6,10 +6,6 @@ from typing import Callable, Dict, Iterator, Optional
 import cv2
 import numpy as np
 from ultralytics import YOLO
-try:
-    import redis
-except Exception:
-    redis = None
 
 from utils.settings_manager import load_detection_settings
 
@@ -26,8 +22,6 @@ class VideoStreamManager:
         self,
         demo_dir: Path,
         model_loader: Callable[[str], YOLO],
-        redis_client: Optional[object] = None,
-        redis_key: str = "video:latest_frame",
     ):
         self.demo_dir = demo_dir
         self.model_loader = model_loader
@@ -35,10 +29,6 @@ class VideoStreamManager:
         # Lazy-load model to avoid heavy operations during import/startup
         self.model = None
         self.settings = load_detection_settings()
-        # Optional Redis client to store latest frame bytes. Client should implement .set(key, value, ex=...)
-        self.redis_client = redis_client
-        self.redis_key = redis_key
-
         self.capture: Optional[cv2.VideoCapture] = None
         self.thread: Optional[threading.Thread] = None
         self.running = False
@@ -131,14 +121,6 @@ class VideoStreamManager:
                     data = buffer.tobytes()
                     with self.frame_lock:
                         self.latest_frame = data
-                    # Write to Redis (best-effort, non-blocking behavior not required here)
-                    try:
-                        if self.redis_client is not None:
-                            # set with short expiry so stale frames are not kept
-                            self.redis_client.set(self.redis_key, data, ex=5)
-                    except Exception:
-                        # ignore redis errors to keep stream running
-                        pass
                 else:
                     self._set_placeholder("Ошибка кодирования кадра")
 
