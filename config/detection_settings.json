@@ -1,0 +1,12 @@
+{
+  "sourceType": null,
+  "rtspUrl": "",
+  "videoPath": "",
+  "videoFileName": "",
+  "detectionTarget": "vehicles",
+  "detectionModel": "yolo11l.pt",
+  "widgets": {
+    "videoWidget": true,
+    "accessButton": true
+  }
+}
