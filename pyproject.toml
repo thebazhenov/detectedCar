@@ -11,6 +11,7 @@ dependencies = [
     "fastapi (>=0.119.0,<0.120.0)",
     "ultralytics (>=8.3.214,<9.0.0)",
     "opencv-python (>=4.12.0.88,<5.0.0.0)"
+    ,"redis (>=4.6.0)"
 ]
 
 

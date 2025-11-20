@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 25% 10%;
+    --foreground: 0 0% 98%;
+
+    --card: 220 20% 15%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 220 20% 12%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 15% 25%;
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 220 15% 20%;
+    --muted-foreground: 217 10% 65%;
+
+    --accent: 217 91% 60%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 76% 36%;
+    --success-foreground: 0 0% 100%;
+
+    --border: 220 15% 25%;
+    --input: 220 15% 20%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.75rem;
+
+    --glass-bg: 220 20% 15% / 0.6;
+    --glass-border: 0 0% 100% / 0.1;
+    
+    --shadow-card: 0 8px 32px 0 hsl(0 0% 0% / 0.37);
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    background: linear-gradient(135deg, hsl(220 25% 10%) 0%, hsl(230 25% 8%) 100%);
+    min-height: 100vh;
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    background: hsl(var(--glass-bg));
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid hsl(var(--glass-border));
+    box-shadow: var(--shadow-card);
+  }
+  
+  .glass-button {
+    background: hsl(var(--glass-bg));
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid hsl(var(--glass-border));
+    transition: var(--transition-smooth);
+  }
+  
+  .glass-button:hover {
+    background: hsl(220 20% 20% / 0.7);
+    border-color: hsl(217 91% 60% / 0.5);
+  }
+}

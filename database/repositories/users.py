@@ -11,7 +11,7 @@ class UserRepository:
 
     async def create(self, data: UserCreate) -> User:
         hashed = hash_password(data.password)
-        user = User(email=data.email, password=hashed)
+        user = User(email=data.email, password=hashed, role=data.role or "operator")
         self.session.add(user)
         await self.session.flush()
         return user
