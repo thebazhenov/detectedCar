@@ -1,9 +1,9 @@
+import { useState } from "react";
 import { Camera, Info, VideoOff } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { apiBaseUrl } from "@/integrations/api/client";
-import { getAuthToken } from "@/integrations/api/auth";
 import { usePublicDetectionSettings } from "@/hooks/useDetectionSettings";
 import { useDemoVideo } from "@/hooks/useDemoVideo";
 
@@ -15,15 +15,17 @@ const TARGET_LABELS: Record<string, string> = {
 export const VideoWidget = () => {
   const { data: settings } = usePublicDetectionSettings();
   const { data: demoVideo } = useDemoVideo();
-  const token = getAuthToken();
   const sourceType = settings?.sourceType;
   const status = buildStatus(sourceType);
   const detectionTarget = settings?.detectionTarget ?? "vehicles";
   const detectionModel = settings?.detectionModel ?? "yolo11l.pt";
-  const streamUrl =
-    token && sourceType
-      ? `${apiBaseUrl}/video/stream?token=${encodeURIComponent(token)}`
-      : undefined;
+  const [streamError, setStreamError] = useState(false);
+  
+  // Используем новый endpoint из Redis стрима
+  // camera_id можно сделать настраиваемым, пока используем дефолтное значение "1"
+  const cameraId = "1";
+  // Всегда пытаемся показывать стрим из Redis (обработанные кадры с YOLO)
+  const streamUrl = `${apiBaseUrl}/video_feed/${cameraId}`;
 
   const fallbackVideoUrl = buildVideoUrl(demoVideo?.file_url ?? settings?.videoPath);
 
@@ -49,11 +51,24 @@ export const VideoWidget = () => {
       </CardHeader>
       <CardContent>
         <div className="relative aspect-video overflow-hidden rounded-lg border border-primary/20 bg-muted/20">
-          {/* Prefer the processed MJPEG stream when authenticated (token present) so the
-              widget shows YOLO overlays and loops file playback. If no token is available,
-              fall back to serving the static demo video file. */}
-          {streamUrl ? (
-            <img src={streamUrl} alt="YOLO stream" className="h-full w-full object-cover" />
+          {/* Используем обработанный MJPEG стрим из Redis с YOLO overlays.
+              Если стрим недоступен, показываем демо видео файл как fallback. */}
+          {!streamError ? (
+            <img 
+              key={streamUrl}
+              src={streamUrl} 
+              alt="YOLO stream" 
+              className="h-full w-full object-cover"
+              onError={() => {
+                // Если стрим не загружается, переключаемся на fallback
+                console.warn("Stream error, falling back to video", streamUrl);
+                setStreamError(true);
+              }}
+              onLoad={() => {
+                // Стрим успешно загрузился
+                setStreamError(false);
+              }}
+            />
           ) : fallbackVideoUrl ? (
             <video
               src={fallbackVideoUrl}
@@ -91,7 +106,7 @@ const buildStatus = (
     };
   }
   return {
-    label: "Нет сигнала",
+    label: "Сигнал обнаружен",
     className: "bg-destructive/10 text-destructive border-destructive/30",
     indicator: "bg-destructive",
   };

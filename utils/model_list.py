@@ -1,6 +1,6 @@
 model_list = {
     "detect_car": {
-        "model": "yolo11l.pt",
+        "model": "yolo11n.pt",
         "classes": [2,7]
         },
     "detect_people_with_phones": {

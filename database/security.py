@@ -1,7 +1,13 @@
 from passlib.context import CryptContext
 
-# bcrypt_sha256 => безопасно для длинных паролей и unicode
-pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+# Argon2id — самый безопасный вариант
+pwd_context = CryptContext(
+    schemes=["argon2"],
+    deprecated="auto",
+    argon2__memory_cost=102400,  # 100 MB RAM
+    argon2__time_cost=2,         # 2 iterations
+    argon2__parallelism=8,       # 8 threads
+)
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)

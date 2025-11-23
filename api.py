@@ -1,8 +1,13 @@
 import threading
+import redis
+import httpx
+import uvicorn
+import base64
+import cv2, base64, numpy as np
+import time
 
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends, status, Query, Response, WebSocket, WebSocketDisconnect
 import asyncio
-import base64
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,20 +16,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Literal, Any
 from uuid import uuid4
-import cv2, base64, numpy as np
 from io import BytesIO
 from PIL import Image
 from ultralytics import YOLO
-import uvicorn
 from models import *
-from yolo_class import YoloClass
-import httpx
+from update_yolo_class import YoloClass
 from pydantic import BaseModel, Field
-
 from database.schemas import *
 from database.uow import UnitOfWork
 from database.models import User
-
 from utils.settings_manager import (
     load_detection_settings,
     update_detection_settings,
@@ -34,58 +34,44 @@ from utils.video_stream import VideoStreamManager
 
 app = FastAPI()
 security = HTTPBasic()
+
+redis_server = redis.Redis(host="localhost", port=6379, db=0)
+
+
 ADMIN_EMAIL = "admin@example.com"
 ADMIN_PASSWORD = "admin"
 ROLE_ADMIN = "admin"
+
+# In-memory storage for active detections
+detection_dict = {}
+
+class StartDetectionRequest(BaseModel):
+    source: str
+    camera_id: str
+    function_name: str
+    skip_frames: Optional[int] = 5  # default to 1 if not provided
+
+class StopDetectionRequest(BaseModel):
+    camera_id: str
+
 
 
 def ensure_admin_user(user: User):
     if user.role != ROLE_ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
 
-# @app.on_event("startup")
-# async def _ensure_admin_and_demo():
-#     # Try to create admin user if DB is reachable
-#     try:
-#         async with UnitOfWork()() as uow:
-#             existing = await uow.users.by_email(ADMIN_EMAIL)
-#             if not existing:
-#                 await uow.users.create(UserCreate(email=ADMIN_EMAIL, password=ADMIN_PASSWORD, role=ROLE_ADMIN))
-#     except Exception as e:
-#         print(f"Startup DB check skipped: {e}")
-
-    # # On startup, if detection source not configured, select latest demo video automatically
-    # try:
-    #     current = load_detection_settings()
-    #     if current.get("sourceType") is None:
-    #         latest = _latest_demo_video()
-    #         if latest:
-    #             resp = _demo_video_response(latest.name)
-    #             updated = update_detection_settings(
-    #                 {
-    #                     "sourceType": "file",
-    #                     "videoPath": resp["file_url"],
-    #                     "videoFileName": latest.name,
-    #                 }
-    #             )
-    #             # ensure video manager picks up new settings
-    #             try:
-    #                 video_stream_manager.update_settings(updated)
-    #             except Exception:
-    #                 pass
-    # except Exception as e:
-    #     print(f"Startup demo selection skipped: {e}")
+@app.on_event("startup")
+async def _ensure_admin_and_demo():
+    # Try to create admin user if DB is reachable
+    try:
+        async with UnitOfWork()() as uow:
+            existing = await uow.users.by_email(ADMIN_EMAIL)
+            if not existing:
+                await uow.users.create(UserCreate(email=ADMIN_EMAIL, password=ADMIN_PASSWORD, role=ROLE_ADMIN))
+    except Exception as e:
+        print(f"Startup DB check skipped: {e}")
 
 
-# @app.on_event("startup")
-# async def ensure_admin_exists():
-#     # Run the startup tasks but don't let DB/connectivity issues block startup.
-#     try:
-#         await asyncio.wait_for(_ensure_admin_and_demo(), timeout=5.0)
-#     except asyncio.TimeoutError:
-#         print("Startup tasks timed out (DB likely unavailable). Continuing without DB initialization.")
-#     except Exception as e:
-#         print(f"Unexpected error during startup tasks: {e}")
 
 # Настройка разрешенных доменов
 origins = [
@@ -135,7 +121,6 @@ MAX_DEMO_VIDEO_SIZE_MB = 200
 
 # Простейшее «хранилище» результатов в памяти
 RESULTS_DB: List[Dict] = []
-
 
 def resolve_model_path(model_name: str) -> Path:
     candidate = YOLO_MODELS_DIR / model_name
@@ -299,18 +284,37 @@ async def auth_user(payload: AuthRequest):
         return user
 
 
+class StartDetectionYolo(BaseModel):
+    source: str           # путь к видео или rtsp
+    camera_id: str
+    skip_frames: int = 1
+    resize_w: int | None = None
+    resize_h: int | None = None
+
+
 @app.post("/start_detection")
-def start_detection(detection: StartDetectionYolo):
+def start_detection(payload: StartDetectionYolo):
 
-    detection = YoloClass(int(detection.source), detection.camera_id, detection.function_name, detection.skip_frames)
-    detection_dict[detection.camera_id]: YoloClass = detection
+    resize = None
+    if payload.resize_w and payload.resize_h:
+        resize = (payload.resize_w, payload.resize_h)
 
-    thread = threading.Thread(target=detection.run)
+    detector = YoloClass(
+        source=payload.source,               # Путь
+        camera_id=payload.camera_id,         # ID камеры
+        skip_frames=payload.skip_frames,
+        resize=resize,
+        model_path="yolo11n.pt"           # YOLO-модель в корне репозитория
+    )
+
+    # сохраняем объект в словарь активных детекций
+    detection_dict[payload.camera_id] = detector
+
+    # запускаем YOLO в отдельном потоке
+    thread = threading.Thread(target=detector.run, daemon=True)
     thread.start()
 
-    return {
-        "message": "Detection started"
-    }
+    return {"message": f"Detection started for camera {payload.camera_id}"}
 
 @app.post("/detect_image")
 async def detect_objects(
@@ -626,6 +630,37 @@ def stop_detection(detection: StopDetectionYolo):
         HTTPException(
             status_code=500
         )
+
+def generate_processed(camera_id):
+    stream_start_date = datetime.now().date()
+
+    while True:
+        if datetime.now().date() != stream_start_date:
+            break
+
+        # читаем обработанный кадр
+        frame = redis_server.get(f"{camera_id}_processed_frame")
+        flag = redis_server.get(f"{camera_id}_processed_flag")
+
+        # Redis → bytes, поэтому сравнение с b"1"
+        if flag == b"1" and frame:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" +
+                frame +
+                b"\r\n"
+            )
+
+        time.sleep(0.03)   # ~30 FPS
+
+
+
+@app.get("/video_feed/{camera_id}")
+def video_feed(camera_id: str):
+    return StreamingResponse(
+        generate_processed(camera_id),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, port=8000)

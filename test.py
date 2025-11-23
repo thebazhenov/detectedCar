@@ -1,9 +1,13 @@
-import requests
+from update_yolo_class import YoloClass
 
-response = requests.post(
-    "http://localhost:8081/nomer",
-    files={"file": ("test.jpg", open("data/test.jpg", "rb"), "image/jpg")}
+VIDEO = r"C:\Users\theba\PycharmProjects\detectedCar\demo\6011568_Car_Vehicle_3840x2160.mp4"
+
+yolo = YoloClass(
+    source=VIDEO,
+    camera_id="1",
+    skip_frames=5,
+    resize=(1280, 720),
+    model_path="yolo11n.pt"    # модель в корне проекта
 )
 
-assert response.status_code == 200, response.json()
-print(response.json())
+yolo.run()
