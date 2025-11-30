@@ -5,6 +5,7 @@ import uvicorn
 import base64
 import cv2, base64, numpy as np
 import time
+import requests
 
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends, status, Query, Response, WebSocket, WebSocketDisconnect
 import asyncio
@@ -36,6 +37,7 @@ app = FastAPI()
 security = HTTPBasic()
 
 redis_server = redis.Redis(host="localhost", port=6379, db=0)
+CHATGPT_PLATE_URL = "http://localhost:8080/plate"
 
 
 ADMIN_EMAIL = "admin@example.com"
@@ -198,7 +200,7 @@ def detection_response(settings: Dict[str, Any], mask_rtsp: bool = False) -> Det
         data["rtspUrl"] = "***"
     return DetectionSettingsResponse(**data)
 
-NOMEROFF_URL = "http://localhost:8081/nomer"  # сервис A
+NOMEROFF_URL = "http://localhost:8182/nomer"  # сервис A
 
 def pil_to_bgr(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
@@ -283,6 +285,53 @@ async def auth_user(payload: AuthRequest):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         return user
 
+# ----------------------------------------------------------------------
+# Эндпоинт: получить crop одного авто по vehicle_id
+# ----------------------------------------------------------------------
+@app.get("/vehicle/frame/{camera_id}/{vehicle_id}")
+def get_vehicle_frame(camera_id: str, vehicle_id: int):
+    detector = detection_dict.get(camera_id)
+    if not detector:
+        raise HTTPException(status_code=404, detail="Camera not active")
+
+    frame = detector.vehicle_frames.get(vehicle_id)
+    if not frame:
+        raise HTTPException(status_code=404, detail="Vehicle frame not found")
+
+    return Response(content=frame, media_type="image/jpeg")
+
+
+# ----------------------------------------------------------------------
+# Модель запроса для /vehicle/plate
+# ----------------------------------------------------------------------
+class PlateRequest(BaseModel):
+    camera_id: str
+    vehicle_id: int
+
+
+# ----------------------------------------------------------------------
+# Эндпоинт: определение номера у конкретного vehicle_id
+# ----------------------------------------------------------------------
+@app.post("/vehicle/plate")
+async def get_vehicle_plate(payload: PlateRequest):
+
+    detector = detection_dict.get(payload.camera_id)
+    if not detector:
+        raise HTTPException(status_code=404, detail="Camera not active")
+
+    frame = detector.vehicle_frames.get(payload.vehicle_id)
+    if not frame:
+        raise HTTPException(status_code=404, detail="Vehicle frame not found")
+
+    files = {
+        "file": ("crop.jpg", frame, "image/jpeg")
+    }
+
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(CHATGPT_PLATE_URL, files=files)
+        resp.raise_for_status()
+        return resp.json()
+
 
 class StartDetectionYolo(BaseModel):
     source: str           # путь к видео или rtsp
@@ -290,6 +339,136 @@ class StartDetectionYolo(BaseModel):
     skip_frames: int = 1
     resize_w: int | None = None
     resize_h: int | None = None
+
+barrier = False
+
+
+async def get_available():
+    """Проверяет доступность номера, используя список из базы данных"""
+    # Получаем список активных номеров из базы данных
+    async with UnitOfWork()() as uow:
+        available_plates = await uow.vehicles.get_active_plates()
+    
+    if not available_plates:
+        return {"status": "no_vehicle"}  # Нет разрешенных номеров в базе
+
+    # Ждем появления ключа в Redis (макс 30 секунд)
+    timeout = 30
+    interval = 0.5
+    waited = 0
+    data = None
+    while waited < timeout:
+        data = redis_server.get("vehicle_in")
+        if data:
+            break
+        waited += interval
+        await asyncio.sleep(interval)
+
+    if not data:
+        return {"status": "no_vehicle"}  # ключ так и не появился
+
+    # Декодируем изображение
+    nparr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    success, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+
+    files = {"file": ("vehicle.jpg", buffer.tobytes(), "image/jpeg")}
+
+    print(f"Отправка на {NOMEROFF_URL} ...")
+    response = requests.post(NOMEROFF_URL, files=files)
+    result = response.json()
+    plates = result.get("plates", [])
+    for plate in plates:
+        for frame in plate:
+            if frame in available_plates:
+                return {"status": "available"}
+    return {"status": "not_available"}
+
+@app.get("/available_plate")
+async def get_available_plate():
+    return await get_available()
+
+
+@app.get("/barrier/status")
+def get_barrier_status():
+    """Получить текущий статус шлагбаума из Redis"""
+    status = redis_server.get("barrier_status")
+    if status:
+        return {"status": status.decode("utf-8")}
+    return {"status": "down"}
+
+
+def set_barrier_down_after_delay():
+    """Установить шлагбаум в положение 'down' через 10 секунд"""
+    time.sleep(10)
+    redis_server.set("barrier_status", "down")
+
+
+@app.get("/barrier/check")
+async def check_and_raise_barrier():
+    """Проверить доступность номера и автоматически поднять шлагбаум"""
+    result = await get_available()
+    
+    if result.get("status") == "available":
+        # Устанавливаем статус "up" в Redis
+        redis_server.set("barrier_status", "up")
+        
+        # Запускаем поток для автоматического опускания через 10 секунд
+        thread = threading.Thread(target=set_barrier_down_after_delay)
+        thread.daemon = True
+        thread.start()
+        
+        return {"status": "up", "message": "Шлагбаум поднят автоматически"}
+    
+    # Если не available, возвращаем текущий статус из Redis
+    current_status = redis_server.get("barrier_status")
+    if current_status:
+        return {"status": current_status.decode("utf-8")}
+    
+    return {"status": "down"}
+
+
+# ----------------------------------------------------------------------
+# Эндпоинты для управления разрешенными номерами
+# ----------------------------------------------------------------------
+
+@app.get("/vehicles", response_model=list[VehicleRead])
+async def list_vehicles(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    active_only: bool = Query(False),
+    current_user: User = Depends(get_current_user)
+):
+    """Получить список разрешенных номеров"""
+    async with UnitOfWork()() as uow:
+        vehicles = await uow.vehicles.list(limit=limit, offset=offset, active_only=active_only)
+        return vehicles
+
+
+@app.post("/vehicles", response_model=VehicleRead, status_code=201)
+async def create_vehicle(
+    payload: VehicleCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Добавить новый разрешенный номер"""
+    async with UnitOfWork()() as uow:
+        # Проверяем, не существует ли уже такой номер
+        existing = await uow.vehicles.get_by_plate(payload.license_plate)
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Номер {payload.license_plate} уже существует в базе"
+            )
+        vehicle = await uow.vehicles.create(payload)
+        return vehicle
+
+
+@app.get("/vehicles/plates")
+async def get_active_plates(current_user: User = Depends(get_current_user)):
+    """Получить список активных номеров для проверки доступа"""
+    async with UnitOfWork()() as uow:
+        plates = await uow.vehicles.get_active_plates()
+        return {"plates": plates}
 
 
 @app.post("/start_detection")
@@ -300,100 +479,21 @@ def start_detection(payload: StartDetectionYolo):
         resize = (payload.resize_w, payload.resize_h)
 
     detector = YoloClass(
-        source=payload.source,               # Путь
-        camera_id=payload.camera_id,         # ID камеры
+        source=payload.source,
+        camera_id=payload.camera_id,
         skip_frames=payload.skip_frames,
         resize=resize,
-        model_path="yolo11n.pt"           # YOLO-модель в корне репозитория
+        model_path="yolo11n.pt"
     )
-
-    # сохраняем объект в словарь активных детекций
+    detector.set_region((678, 186, 1055, 471))
     detection_dict[payload.camera_id] = detector
 
-    # запускаем YOLO в отдельном потоке
+    import threading
     thread = threading.Thread(target=detector.run, daemon=True)
     thread.start()
 
     return {"message": f"Detection started for camera {payload.camera_id}"}
 
-@app.post("/detect_image")
-async def detect_objects(
-    title: str = Form(...),
-    description: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-):
-    try:
-        contents = await file.read()
-        image = Image.open(BytesIO(contents)).convert("RGB")
-        image_np = np.array(image)
-        print(description)
-        class_yolo = {
-            "car": 2,
-            "people": 0
-        }
-        # Детекция
-        try:
-            m = get_model()
-            results = m(image_np, classes=[class_yolo.get(description, None)])
-        except Exception as e:
-            print(f"YOLO inference skipped: {e}")
-            results = []
-        plates = []
-        if description in "car":
-            async with httpx.AsyncClient(timeout=30) as client:
-                files = {
-                    "file": (
-                        file.filename, contents, file.content_type)
-                }
-                resp = await client.post(NOMEROFF_URL, files=files)
-                print(resp)
-                resp.raise_for_status()
-                data = resp.json()
-                print(data)
-                plates = data["plates"]
-
-        # Отрисованная картинка -> JPG буфер
-        if not results:
-            annotated = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-        else:
-            annotated = results[0].plot()  # ndarray (BGR)
-        ok, buffer = cv2.imencode(".jpg", annotated)
-        if not ok:
-            raise RuntimeError("cv2.imencode failed")
-
-        # === Сохраняем файл в static/uploads ===
-        filename = f"{datetime.utcnow():%Y%m%d_%H%M%S}_{uuid4().hex}.jpg"
-        file_path = UPLOADS_DIR / filename
-        file_path.write_bytes(buffer.tobytes())
-
-        # Относительная ссылка для фронта (именно такая нужна твоему getResults)
-        link = f"static/uploads/{filename}"
-
-        # Сохраняем запись в «базу результатов»
-        record = {
-            "Id": str(uuid4()),
-            "Link": link,                       # фронт склеит http://localhost:5000/ + Link
-            "Date": datetime.utcnow().isoformat(),
-            "Title": title,
-            "Description": plates,
-            "Source": "-",                      # при необходимости — свой источник
-        }
-        RESULTS_DB.append(record)
-
-        # Отправим и base64 (если нужно показать сразу) и путь для списка
-        image_base64 = base64.b64encode(buffer).decode("utf-8")
-        return JSONResponse({
-            "title": title,
-            "description": description,
-            "annotated_image": image_base64,
-            "link": link,                      # <- можно использовать на фронте сразу
-        })
-
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
-    finally:
-        await file.close()
 
 @app.get("/get-results")
 def get_results():
@@ -599,37 +699,19 @@ async def websocket_video(websocket: WebSocket, token: str = Query(..., alias="t
             pass
         return
 
-
-
-    # @app.post("/upload_image/")
-    # async def upload_image(file: Annotated[UploadFile, File(...)]):
-    #     contents = await file.read()  # Читаем содержимое файла
-    #     filename = file.filename  # Получаем оригинальное имя файла
-    #     content_type = file.content_type  # Тип содержимого (например, image/jpeg)
-    #
-    #     # Здесь можем сохранить файл или обработать его
-    #     with open(filename, "wb") as f:
-    #         f.write(contents)
-    #
-    #     return {"filename": filename, "content-type": content_type}
-
+class StopDetectionYolo(BaseModel):
+    camera_id: str
 
 @app.post("/stop_detection")
-def stop_detection(detection: StopDetectionYolo):
+def stop_detection(payload: StopDetectionYolo):
 
-    if detection.camera_id in detection_dict:
-        det = detection_dict.get(detection.camera_id)
-        det.stop()
-        del detection_dict[detection.camera_id]
+    detector = detection_dict.get(payload.camera_id)
+    if detector:
+        detector.stop()
+        del detection_dict[payload.camera_id]
+        return {"message": f"Detection stopped for {payload.camera_id}"}
 
-        return {
-            "message": f"Detection stopped for Camera ID {detection.camera_id}"
-        }
-
-    else:
-        HTTPException(
-            status_code=500
-        )
+    raise HTTPException(status_code=404, detail="Camera not found")
 
 def generate_processed(camera_id):
     stream_start_date = datetime.now().date()

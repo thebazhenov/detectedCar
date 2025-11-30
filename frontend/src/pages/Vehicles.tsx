@@ -4,7 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { supabase } from "@/integrations/supabase/client";
+import { getVehicles, createVehicle, VehicleCreate } from "@/integrations/api/vehicles";
 import { useState } from "react";
 import {
   Dialog,
@@ -25,21 +25,12 @@ const Vehicles = () => {
 
   const { data: vehicles, isLoading } = useQuery({
     queryKey: ["vehicles"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("vehicles")
-        .select("*")
-        .order("created_at", { ascending: false });
-      
-      if (error) throw error;
-      return data;
-    },
+    queryFn: () => getVehicles(),
   });
 
   const addVehicleMutation = useMutation({
-    mutationFn: async (data: { license_plate: string; owner_name: string; notes?: string }) => {
-      const { error } = await supabase.from("vehicles").insert([data]);
-      if (error) throw error;
+    mutationFn: async (data: VehicleCreate) => {
+      return createVehicle(data);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["vehicles"] });

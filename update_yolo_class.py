@@ -1,12 +1,35 @@
 import cv2
-import copy
 import redis
+import numpy as np
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Annotator, colors
+from typing import Optional, List, Tuple, Union
+import os
+from datetime import datetime
+
+RegionType = Union[Tuple[int, int, int, int], List[Tuple[int, int]]]
 
 
 class YoloClass:
-    def __init__(self, source, camera_id, skip_frames=1, resize=None, model_path="yolo_model.pt"):
+    """
+    YOLO детектор с трекингом, сохранением crop по vehicle_id и поддержкой региона отображения.
+
+    region может быть:
+      - None (без региона)
+      - прямоугольник: (x1, y1, x2, y2)
+      - многоугольник: [(x1, y1), (x2, y2), ...]
+    """
+
+    def __init__(
+        self,
+        source,
+        camera_id,
+        skip_frames=1,
+        resize=None,
+        model_path="yolo_model.pt",
+        region: Optional[RegionType] = None,
+    ):
+        self.source = source
         self.videocapture = cv2.VideoCapture(source)
         if not self.videocapture.isOpened():
             raise RuntimeError(f"❌ Не удалось открыть видеоисточник: {source}")
@@ -23,35 +46,156 @@ class YoloClass:
         self.detection_status = True
         self.resize = resize
 
+        # сохранения кадра по id
+        self.vehicle_frames = {}  # vehicle_id -> jpeg bytes
+
+        # Redis для стриминга
         self.redis_server = redis.Redis(host="localhost", port=6379, db=0)
 
-        print("🚀 YoloClass инициализирован — детекция ТОЛЬКО транспорта")
+        # Регион (None, rect, or polygon)
+        self.region = None
+        if region is not None:
+            self.set_region(region)
 
-    # ---------------------------------------------------
-    # 🚗 ДЕТЕКЦИЯ ТОЛЬКО МАШИН (возвращает обработанный кадр)
-    # ---------------------------------------------------
-    def detect_cars(self):
-        results = self.model(self.frame, classes=self.car_classes)
+        print("🚀 YoloClass инициализирован — детекция транспорта с трекингом и регионом")
 
-        boxes = results[0].boxes
-        if boxes is None:
-            return self.frame
+    # ---------------------- region helpers ----------------------
+    def set_region(self, region: RegionType):
+        """
+        region:
+          - (x1, y1, x2, y2)  -> rectangle
+          - [(x1,y1), (x2,y2), ...] -> polygon
+        """
+        if isinstance(region, tuple) and len(region) == 4:
+            x1, y1, x2, y2 = region
+            pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+        else:
+            # assume polygon-like list of tuples
+            pts = np.array(region, dtype=np.int32)
 
-        annotated_frame = self.frame.copy()
-        annotator = Annotator(annotated_frame, line_width=2)
+        # ensure shape (N, 2)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            raise ValueError("region must be (x1,y1,x2,y2) or list of (x,y) tuples")
 
-        xyxy = boxes.xyxy.cpu()
-        clss = boxes.cls.cpu().tolist()
+        self.region = pts
+
+    def clear_region(self):
+        self.region = None
+
+    def _is_point_in_region(self, x: int, y: int) -> bool:
+        """Возвращает True если точка внутри region. Если region отсутствует - False."""
+        if self.region is None:
+            return False
+        # cv2.pointPolygonTest принимает contour как Nx2 или Nx1x2
+        return cv2.pointPolygonTest(self.region, (int(x), int(y)), False) >= 0
+
+    # ------------------------------------------------------------------
+    # Основная детекция + трекинг
+    # ------------------------------------------------------------------
+    def detect_and_track(self, frame):
+        results = self.model.track(frame, persist=True, classes=self.car_classes)
+
+        any_vehicle_in_region = False
+        tracked_objects = []
+
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        ids = results[0].boxes.id
+        clss = results[0].boxes.cls.cpu().numpy()
         names = results[0].names
 
-        for box, cls in zip(xyxy, clss):
-            annotator.box_label(box, names[int(cls)], color=colors(int(cls), True))
+        if ids is not None:
+            ids = ids.cpu().numpy()
 
-        return annotated_frame
+        annotator = Annotator(frame.copy(), line_width=2)
 
-    # ---------------------------------------------------
-    # 🔄 Основной цикл
-    # ---------------------------------------------------
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(int, box)
+            cls = int(clss[i])
+            obj_id = int(ids[i]) if ids is not None else None
+
+            # центр
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+
+            in_region = self._is_point_in_region(cx, cy) if self.region is not None else False
+            if in_region:
+                any_vehicle_in_region = True
+
+            # рисование бокса
+            box_color = colors(cls, True)
+            label = f"{names[cls]}"
+            if obj_id is not None:
+                label += f" ID:{obj_id}"
+            label += f" {'IN' if in_region else 'OUT'}"
+
+            annotator.box_label([x1, y1, x2, y2], label, color=box_color)
+
+            tracked_objects.append({
+                "id": obj_id,
+                "bbox": [x1, y1, x2, y2],
+                "in_region": in_region
+            })
+
+        annotated = annotator.result()
+        annotated = self._draw_region_overlay(annotated)
+
+        # ---- Проверяем, есть ли активное транспортное средство в регионе ----
+        if not hasattr(self, "vehicle_active_in_region"):
+            self.vehicle_active_in_region = False
+
+        if any_vehicle_in_region and not self.vehicle_active_in_region:
+            # Сохраняем кадр один раз при первом появлении
+            ok, buf = cv2.imencode(".jpg", frame)
+            if ok:
+                self.redis_server.set("vehicle_in", buf.tobytes())
+                os.makedirs("detect_image", exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                filename = f"detect_image/vehicle_{timestamp}.jpg"
+                cv2.imwrite(filename, frame)
+            self.vehicle_active_in_region = True
+        elif not any_vehicle_in_region and self.vehicle_active_in_region:
+            # Автомобиль ушел — сбрасываем состояние
+            self.redis_server.delete("vehicle_in")
+            self.vehicle_active_in_region = False
+
+        return annotated, tracked_objects
+
+    # ------------------------------------------------------------------
+    # region drawing
+    # ------------------------------------------------------------------
+    def _draw_region_overlay(self, img: np.ndarray) -> np.ndarray:
+        """Рисует полупрозрачный регион и контур. Возвращает изображение."""
+        if self.region is None:
+            return img
+
+        overlay = img.copy()
+        out = img.copy()
+
+        # fill region with alpha
+        pts = self.region.reshape((-1, 1, 2))
+        cv2.fillPoly(overlay, [pts], color=(0, 255, 0))  # fill (will be blended)
+        alpha = 0.15
+        cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0, out)
+
+        # draw polygon border thicker
+        cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        # label region in top-left corner of bbox of region
+        x, y, w, h = cv2.boundingRect(pts)
+        text = "Region"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 1
+        (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        # text background
+        cv2.rectangle(out, (x, y - th - 8), (x + tw + 8, y), (0, 255, 0), -1)
+        cv2.putText(out, text, (x + 4, y - 6), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Основной цикл
+    # ------------------------------------------------------------------
     def run(self):
         while self.detection_status:
 
@@ -62,18 +206,10 @@ class YoloClass:
 
             ret, frame = self.videocapture.read()
 
-            # Если это файл, а не rtsp — зацикливаем
             if not ret:
-                # Проверяем, RTSP или нет
-                if not str(self.source).startswith("rtsp://"):
-                    # зацикливаем видео
-                    self.videocapture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                else:
-                    print("RTSP поток прерван.")
-                    break
+                self.videocapture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
 
-            # Масштабирование
             if self.resize:
                 w, h = self.resize
                 frame = cv2.resize(frame, (w, h))
@@ -81,36 +217,23 @@ class YoloClass:
             self.frame = frame
             self.frame_counter += 1
 
-            # ---------------------------------------------------
-            # 1️⃣ Кодирование обычного (сырого) кадра
-            # ---------------------------------------------------
+            # RAW frame → Redis
             ok_raw, encoded_raw = cv2.imencode(".jpg", frame)
             if ok_raw:
                 self.redis_server.set(f"{self.camera_id}_stream_frame", encoded_raw.tobytes())
                 self.redis_server.set(f"{self.camera_id}_stream_flag", 1)
-            else:
-                self.redis_server.set(f"{self.camera_id}_stream_flag", 0)
 
-            # ---------------------------------------------------
-            # 2️⃣ Обработка кадра (детекция машин)
-            # ---------------------------------------------------
-            processed = self.detect_cars()
+            # DETECT + TRACK
+            processed, tracked = self.detect_and_track(frame)
 
-            # ---------------------------------------------------
-            # 3️⃣ Сохранение ОБРАБОТАННОГО кадра в Redis
-            # ---------------------------------------------------
-            ok_processed, encoded_processed = cv2.imencode(".jpg", processed)
-            if ok_processed:
-                self.redis_server.set(f"{self.camera_id}_processed_frame", encoded_processed.tobytes())
+            # Save processed frame
+            ok_p, enc_p = cv2.imencode(".jpg", processed)
+            if ok_p:
+                self.redis_server.set(f"{self.camera_id}_processed_frame", enc_p.tobytes())
                 self.redis_server.set(f"{self.camera_id}_processed_flag", 1)
-            else:
-                self.redis_server.set(f"{self.camera_id}_processed_flag", 0)
 
-            # ---------------------------------------------------
-            # 4️⃣ Показываем обработанный кадр
-            # ---------------------------------------------------
+            # Show window
             cv2.imshow(f"Camera {self.camera_id}", processed)
-
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 

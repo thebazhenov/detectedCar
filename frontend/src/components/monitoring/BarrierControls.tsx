@@ -2,13 +2,51 @@ import { ArrowUp, ArrowDown, Lock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "sonner";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { apiFetch } from "@/integrations/api/client";
+
+interface BarrierStatusResponse {
+  status: "up" | "down";
+  message?: string;
+}
 
 export const BarrierControls = () => {
   const [barrierState, setBarrierState] = useState<"up" | "down">("down");
   const queryClient = useQueryClient();
+
+  // Автоматическая проверка доступности каждые 5 секунд
+  useEffect(() => {
+    const checkBarrierStatus = async () => {
+      try {
+        const response = await apiFetch<BarrierStatusResponse>("/barrier/check");
+        const newStatus = response.status;
+        
+        setBarrierState((prevStatus) => {
+          if (newStatus !== prevStatus) {
+            if (newStatus === "up") {
+              toast.success("Шлагбаум поднят автоматически", {
+                icon: <ArrowUp className="h-4 w-4" />,
+              });
+            }
+            return newStatus;
+          }
+          return prevStatus;
+        });
+      } catch (error) {
+        console.error("Ошибка при проверке статуса шлагбаума:", error);
+      }
+    };
+
+    // Первая проверка сразу
+    checkBarrierStatus();
+
+    // Затем каждые 5 секунд
+    const interval = setInterval(checkBarrierStatus, 5000);
+
+    return () => clearInterval(interval);
+  }, []); // Пустой массив зависимостей - интервал создается только один раз
 
   const logEventMutation = useMutation({
     mutationFn: async (action: "up" | "down") => {
@@ -54,7 +92,7 @@ export const BarrierControls = () => {
         <div className="p-4 rounded-lg border border-primary/20 bg-primary/5">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm text-muted-foreground">Текущий статус:</span>
-            <span className={`font-semibold ${barrierState === "up" ? "text-success" : "text-muted-foreground"}`}>
+            <span className={`font-semibold ${barrierState === "up" ? "text-muted-foreground" : "text-muted-foreground"}`}>
               {barrierState === "up" ? "🔺 Поднят" : "🔻 Опущен"}
             </span>
           </div>

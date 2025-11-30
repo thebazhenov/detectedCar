@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
 from .db import SessionLocal
-from .repositories import UserRepository
+from .repositories import UserRepository, VehicleRepository
 
 class UnitOfWork:
     def __init__(self):
         self.session = SessionLocal()
         self.users = UserRepository(self.session)
+        self.vehicles = VehicleRepository(self.session)
 
     @asynccontextmanager
     async def __call__(self):
